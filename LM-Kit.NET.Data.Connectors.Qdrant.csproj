@@ -1,0 +1,29 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFrameworks>netstandard2.0;net6.0;net7.0;net8.0;net9.0</TargetFrameworks>
+		<LangVersion>latest</LangVersion>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+		<Version>2025.4.1</Version>
+		<RootNamespace>LMKit.Data.Connectors.Qdrant</RootNamespace>
+		<GenerateDocumentationFile>True</GenerateDocumentationFile>
+		<Configurations>Debug;Release</Configurations>
+		<SignAssembly>True</SignAssembly>
+		<AssemblyOriginatorKeyFile>LMKit.Data.Connectors.Qdrant.snk</AssemblyOriginatorKeyFile>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+		<SignAssembly>False</SignAssembly>
+	</PropertyGroup>
+
+
+	<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+		<TreatWarningsAsErrors>True</TreatWarningsAsErrors>
+	</PropertyGroup>
+	
+	<ItemGroup>
+        <PackageReference Include="LM-Kit.NET" Version="2025.4.1" />
+        <PackageReference Include="Qdrant.Client" Version="1.13.0" />
+     </ItemGroup>
+
+</Project>
