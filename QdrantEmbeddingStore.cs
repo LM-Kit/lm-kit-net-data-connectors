@@ -12,22 +12,86 @@ namespace LMKit.Data.Storage.Qdrant
     {
         private readonly QdrantClient _client;
 
+
         /// <summary>
-        /// Initializes a new instance of the <see cref="QdrantEmbeddingStore"/> class with the specified Qdrant service address and optional API key.
+        /// Initializes a new instance of the <see cref="QdrantEmbeddingStore"/>.
         /// </summary>
-        /// <param name="address">The URI address of the Qdrant service.</param>
-        /// <param name="apiKey">An optional API key used for authentication with the Qdrant service.</param>
-        /// <exception cref="ArgumentNullException">Thrown if <paramref name="address"/> is null.</exception>
-        public QdrantEmbeddingStore(Uri address, string apiKey = null)
+        /// <param name="address">The URI of the Qdrant service endpoint. Must not be null.</param>
+        /// <param name="apiKey">An optional API key for authentication.</param>
+        /// <param name="certificateThumbprint">
+        /// An optional SHA-256 certificate thumbprint to enable secure GRPC communication.
+        /// If provided, a secure channel is used; otherwise, a standard connection is created.
+        /// </param>
+        /// <exception cref="ArgumentNullException">Thrown when <paramref name="address"/> is null.</exception>
+        public QdrantEmbeddingStore(Uri address, string apiKey = null, string certificateThumbprint = null)
         {
-            _client = new QdrantClient(address ?? throw new ArgumentNullException(nameof(address)), apiKey);
+            if (!string.IsNullOrWhiteSpace(certificateThumbprint))
+            {
+                var channel = QdrantChannel.ForAddress(address,
+                     new ClientConfiguration
+                     {
+                         CertificateThumbprint = certificateThumbprint,
+                         ApiKey = apiKey
+                     }
+                   );
+                var grpcClient = new QdrantGrpcClient(channel);
+                _client = new QdrantClient(grpcClient);
+            }
+            else
+            {
+                _client = new QdrantClient(address ?? throw new ArgumentNullException(nameof(address)), apiKey);
+            }
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="QdrantEmbeddingStore"/> class using a pre-configured <see cref="QdrantGrpcClient"/>.
+        /// This constructor is intended for use under .NET Framework to support HTTPS connections with secure gRPC communication.
+        /// </summary>
+        /// <param name="grpcClient">
+        /// A pre-configured instance of <see cref="QdrantGrpcClient"/> that is set up to use a secure channel (HTTPS)
+        /// with custom certificate thumbprint validation and optional API key authentication.
+        /// 
+        /// Example usage under .NET Framework:
+        /// <code>
+        /// // Update with your API key and certificate thumbprint, if any.
+        /// string apiKey = ""; // update, if any
+        /// string tp = "YOUR_CERTIFICATE_THUMBPRINT";
+        /// 
+        /// // Create a secure gRPC channel using HTTPS and a custom WinHttpHandler for certificate validation.
+        /// var channel = GrpcChannel.ForAddress($"https://localhost:6334", new GrpcChannelOptions
+        /// {
+        ///     HttpHandler = new WinHttpHandler
+        ///     {
+        ///         ServerCertificateValidationCallback = CertificateValidation.Thumbprint(tp)
+        ///     }
+        /// });
+        /// 
+        /// // Intercept the call to add the API key to metadata.
+        /// var callInvoker = channel.Intercept(metadata0 =>
+        /// {
+        ///     metadata0.Add("api-key", apiKey);
+        ///     return metadata0;
+        /// });
+        /// 
+        /// // Create a QdrantGrpcClient using the intercepted call invoker.
+        /// var grpcClient = new QdrantGrpcClient(callInvoker);
+        /// 
+        /// // Instantiate the QdrantEmbeddingStore using the secure gRPC client.
+        /// var store = new QdrantEmbeddingStore(grpcClient);
+        /// </code>
+        /// </param>
+        public QdrantEmbeddingStore(QdrantGrpcClient grpcClient)
+        {
+            _client = new QdrantClient(grpcClient);
         }
 
         /// <inheritdoc/>
         public async Task<bool> CollectionExistsAsync(string collectionIdentifier, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
+            {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
+            }
 
             cancellationToken.ThrowIfCancellationRequested();
             return await _client.CollectionExistsAsync(collectionIdentifier, cancellationToken: cancellationToken);
@@ -37,7 +101,9 @@ namespace LMKit.Data.Storage.Qdrant
         public async Task CreateCollectionAsync(string collectionIdentifier, uint vectorSize, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
+            {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
+            }
 
             cancellationToken.ThrowIfCancellationRequested();
             await _client.CreateCollectionAsync(
@@ -51,7 +117,9 @@ namespace LMKit.Data.Storage.Qdrant
         public async Task DeleteCollectionAsync(string collectionIdentifier, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
+            {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
+            }
 
             cancellationToken.ThrowIfCancellationRequested();
             await _client.DeleteCollectionAsync(collectionIdentifier, cancellationToken: cancellationToken);
@@ -61,12 +129,17 @@ namespace LMKit.Data.Storage.Qdrant
         public async Task<MetadataCollection> GetMetadataAsync(string collectionIdentifier, string id, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
+            {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
+            }
+
             if (string.IsNullOrWhiteSpace(id))
+            {
                 throw new ArgumentException("ID cannot be null or empty.", nameof(id));
+            }
 
             cancellationToken.ThrowIfCancellationRequested();
-            MetadataCollection metadata = new();
+            MetadataCollection metadata = [];
             IReadOnlyList<RetrievedPoint> result;
 
             if (IsUintId(id))
@@ -76,13 +149,17 @@ namespace LMKit.Data.Storage.Qdrant
             else
             {
                 if (!Guid.TryParse(id, out Guid guid))
+                {
                     throw new ArgumentException("Invalid GUID format.", nameof(id));
+                }
 
                 result = await _client.RetrieveAsync(collectionIdentifier, guid, cancellationToken: cancellationToken);
             }
 
             if (result.Count == 0)
+            {
                 throw new KeyNotFoundException($"{collectionIdentifier} with id {id} not found");
+            }
 
             foreach (var pair in result[0].Payload)
             {
@@ -96,16 +173,21 @@ namespace LMKit.Data.Storage.Qdrant
         public async Task<List<PointEntry>> RetrieveFromMetadataAsync(string collectionIdentifier, MetadataCollection metadata, bool getVector, bool getMetadata, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
+            {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
+            }
+
             if (metadata == null)
+            {
                 throw new ArgumentNullException(nameof(metadata));
+            }
 
             cancellationToken.ThrowIfCancellationRequested();
             var filter = new Filter();
 
             foreach (var pair in metadata)
             {
-                var sectionCondition = new Condition
+                var condition = new Condition
                 {
                     Field = new FieldCondition
                     {
@@ -114,7 +196,7 @@ namespace LMKit.Data.Storage.Qdrant
                     }
                 };
 
-                filter.Must.Add(sectionCondition);
+                filter.Must.Add(condition);
             }
 
             var queryResult = await _client.QueryAsync(
@@ -130,7 +212,7 @@ namespace LMKit.Data.Storage.Qdrant
 
             foreach (var entry in queryResult)
             {
-                MetadataCollection metadataResponse = new();
+                MetadataCollection metadataResponse = [];
                 if (entry.Payload != null)
                 {
                     foreach (var pair in entry.Payload)
@@ -148,11 +230,19 @@ namespace LMKit.Data.Storage.Qdrant
         public async Task<List<(PointEntry Point, float Score)>> SearchSimilarVectorsAsync(string collectionIdentifier, float[] vector, uint limit, bool getVector, bool getMetadata, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
+            {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
+            }
+
             if (vector == null || vector.Length == 0)
+            {
                 throw new ArgumentException("Vector cannot be null or empty.", nameof(vector));
+            }
+
             if (limit == 0)
+            {
                 throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be greater than zero.");
+            }
 
             cancellationToken.ThrowIfCancellationRequested();
             var queryResult = await _client.SearchAsync(
@@ -168,7 +258,7 @@ namespace LMKit.Data.Storage.Qdrant
 
             foreach (var entry in queryResult)
             {
-                MetadataCollection metadataResponse = new();
+                MetadataCollection metadataResponse = [];
                 if (entry.Payload != null)
                 {
                     foreach (var pair in entry.Payload)
@@ -186,16 +276,21 @@ namespace LMKit.Data.Storage.Qdrant
         public async Task DeleteFromMetadataAsync(string collectionIdentifier, MetadataCollection metadata, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
+            {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
+            }
+
             if (metadata == null)
+            {
                 throw new ArgumentNullException(nameof(metadata));
+            }
 
             cancellationToken.ThrowIfCancellationRequested();
             var filter = new Filter();
 
             foreach (var pair in metadata)
             {
-                var sectionCondition = new Condition
+                var condition = new Condition
                 {
                     Field = new FieldCondition
                     {
@@ -204,7 +299,7 @@ namespace LMKit.Data.Storage.Qdrant
                     }
                 };
 
-                filter.Must.Add(sectionCondition);
+                filter.Must.Add(condition);
             }
 
             var updateResult = await _client.DeleteAsync(
@@ -214,20 +309,33 @@ namespace LMKit.Data.Storage.Qdrant
             );
 
             if (updateResult.Status != UpdateStatus.Completed)
+            {
                 throw new Exception($"Failed to delete vector from collection '{collectionIdentifier}'");
+            }
         }
 
         /// <inheritdoc/>
         public async Task UpsertAsync(string collectionIdentifier, string id, float[] vectors, MetadataCollection metadata, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
+            {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
+            }
+
             if (string.IsNullOrWhiteSpace(id))
+            {
                 throw new ArgumentException("ID cannot be null or empty.", nameof(id));
+            }
+
             if (vectors == null || vectors.Length == 0)
+            {
                 throw new ArgumentException("Vector data cannot be null or empty.", nameof(vectors));
+            }
+
             if (metadata == null)
+            {
                 throw new ArgumentNullException(nameof(metadata));
+            }
 
             cancellationToken.ThrowIfCancellationRequested();
             var point = new PointStruct
@@ -244,18 +352,28 @@ namespace LMKit.Data.Storage.Qdrant
             var updateResult = await _client.UpsertAsync(collectionIdentifier, new[] { point }, cancellationToken: cancellationToken);
 
             if (updateResult.Status != UpdateStatus.Completed)
+            {
                 throw new Exception($"Failed to upsert vector for collection '{collectionIdentifier}' with id {id}");
+            }
         }
 
         /// <inheritdoc/>
         public async Task UpdateMetadataAsync(string collectionIdentifier, string id, MetadataCollection metadata, bool clearFirst, CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
+            {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
+            }
+
             if (string.IsNullOrWhiteSpace(id))
+            {
                 throw new ArgumentException("ID cannot be null or empty.", nameof(id));
+            }
+
             if (metadata == null)
+            {
                 throw new ArgumentNullException(nameof(metadata));
+            }
 
             cancellationToken.ThrowIfCancellationRequested();
             // Build payload dictionary using metadata key-value pairs.
@@ -272,7 +390,9 @@ namespace LMKit.Data.Storage.Qdrant
                     : await _client.ClearPayloadAsync(collectionIdentifier, id: new Guid(id), cancellationToken: cancellationToken);
 
                 if (clearResult.Status != UpdateStatus.Completed)
+                {
                     throw new Exception($"Failed to clear metadata for collection '{collectionIdentifier}' with id {id}");
+                }
             }
 
             UpdateResult updateResult = IsUintId(id)
@@ -280,7 +400,9 @@ namespace LMKit.Data.Storage.Qdrant
                 : await _client.SetPayloadAsync(collectionIdentifier, payload, id: new Guid(id), cancellationToken: cancellationToken);
 
             if (updateResult.Status != UpdateStatus.Completed)
+            {
                 throw new Exception($"Failed to update metadata for collection '{collectionIdentifier}' with id {id}");
+            }
         }
 
         /// <summary>
@@ -291,15 +413,29 @@ namespace LMKit.Data.Storage.Qdrant
         private static Metadata PayloadEntryToMetadata(KeyValuePair<string, Value> pair)
         {
             if (pair.Value.HasStringValue)
+            {
                 return new Metadata(pair.Key, pair.Value.StringValue);
+            }
+
             if (pair.Value.HasDoubleValue)
+            {
                 return new Metadata(pair.Key, pair.Value.DoubleValue.ToString());
+            }
+
             if (pair.Value.HasBoolValue)
+            {
                 return new Metadata(pair.Key, pair.Value.BoolValue.ToString());
+            }
+
             if (pair.Value.HasIntegerValue)
+            {
                 return new Metadata(pair.Key, pair.Value.IntegerValue.ToString());
+            }
+
             if (pair.Value.HasNullValue)
+            {
                 return new Metadata(pair.Key, pair.Value.NullValue.ToString());
+            }
 
             return new Metadata(pair.Key, pair.Value.ToString());
         }
@@ -323,9 +459,15 @@ namespace LMKit.Data.Storage.Qdrant
         private static PointId ParsePointId(string id)
         {
             if (ulong.TryParse(id, out ulong uintId))
+            {
                 return new PointId(uintId);
+            }
+
             if (Guid.TryParse(id, out Guid guid))
+            {
                 return new PointId(guid);
+            }
+
             throw new ArgumentException("The provided id is neither a valid unsigned long nor a GUID.", nameof(id));
         }
 
