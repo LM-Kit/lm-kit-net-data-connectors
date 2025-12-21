@@ -220,7 +220,7 @@ namespace LMKit.Data.Storage.Qdrant
                         metadataResponse.Add(PayloadEntryToMetadata(pair));
                     }
                 }
-                result.Add(new PointEntry(PointIdToString(entry.Id), entry.Vectors?.Vector?.Data, metadataResponse));
+                result.Add(new PointEntry(PointIdToString(entry.Id), entry.Vectors?.Vector?.GetDenseVector().Data, metadataResponse));
             }
 
             return result;
@@ -266,7 +266,8 @@ namespace LMKit.Data.Storage.Qdrant
                         metadataResponse.Add(PayloadEntryToMetadata(pair));
                     }
                 }
-                result.Add((new PointEntry(PointIdToString(entry.Id), entry.Vectors?.Vector?.Data, metadataResponse), entry.Score));
+                result.Add((new PointEntry(PointIdToString(entry.Id), entry.Vectors?.Vector?.GetDenseVector().Data, metadataResponse), entry.Score));
+
             }
 
             return result;
