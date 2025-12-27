@@ -14,6 +14,16 @@ namespace LMKit.Data.Storage.Qdrant
 
 
         /// <summary>
+        /// Initializes a new instance of the QdrantEmbeddingStore class using the specified QdrantClient.
+        /// </summary>
+        /// <param name="client">The QdrantClient instance used to communicate with the Qdrant service.</param>
+        /// <exception cref="ArgumentNullException">Thrown if <paramref name="client"/> is <see langword="null"/>.</exception>
+        public QdrantEmbeddingStore(QdrantClient client)
+        {
+            _client = client ?? throw new ArgumentNullException(nameof(client));
+        }
+
+        /// <summary>
         /// Initializes a new instance of the <see cref="QdrantEmbeddingStore"/>.
         /// </summary>
         /// <param name="address">The URI of the Qdrant service endpoint. Must not be null.</param>
@@ -39,7 +49,15 @@ namespace LMKit.Data.Storage.Qdrant
             }
             else
             {
-                _client = new QdrantClient(address ?? throw new ArgumentNullException(nameof(address)), apiKey);
+
+                if (address == null)
+                {
+                    throw new ArgumentNullException(nameof(address));
+                }
+                _client = new QdrantClient(
+                    host: address.Host,
+                    https: address.Scheme == "https",
+                    apiKey: apiKey);
             }
         }
 
@@ -98,19 +116,36 @@ namespace LMKit.Data.Storage.Qdrant
         }
 
         /// <inheritdoc/>
-        public async Task CreateCollectionAsync(string collectionIdentifier, uint vectorSize, CancellationToken cancellationToken = default)
+        public async Task CreateCollectionAsync(
+            string collectionIdentifier,
+            uint vectorSize,
+            IEnumerable<string> payloadIndexFields = null,
+            CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
             }
-
             cancellationToken.ThrowIfCancellationRequested();
+
             await _client.CreateCollectionAsync(
                 collectionIdentifier,
                 new VectorParams { Size = vectorSize, Distance = Distance.Cosine },
                 cancellationToken: cancellationToken
             );
+
+            if (payloadIndexFields != null)
+            {
+                foreach (var fieldName in payloadIndexFields)
+                {
+                    await _client.CreatePayloadIndexAsync(
+                        collectionIdentifier,
+                        fieldName,
+                        PayloadSchemaType.Keyword,
+                        cancellationToken: cancellationToken
+                    );
+                }
+            }
         }
 
         /// <inheritdoc/>
@@ -192,7 +227,7 @@ namespace LMKit.Data.Storage.Qdrant
                     Field = new FieldCondition
                     {
                         Key = pair.Key,
-                        Match = new Match { Text = pair.Value }
+                        Match = new Match { Keyword = pair.Value }
                     }
                 };
 
@@ -296,7 +331,7 @@ namespace LMKit.Data.Storage.Qdrant
                     Field = new FieldCondition
                     {
                         Key = pair.Key,
-                        Match = new Match { Text = pair.Value }
+                        Match = new Match { Keyword = pair.Value }
                     }
                 };
 
