@@ -8,19 +8,25 @@ namespace LMKit.Data.Storage.Qdrant
     /// Provides operations for creating, deleting, updating, and querying vector data with associated metadata,
     /// leveraging Qdrant's vector search capabilities.
     /// </summary>
-    public sealed class QdrantEmbeddingStore : IVectorStore
+    public sealed class QdrantEmbeddingStore : IVectorStore, IDisposable
     {
         private readonly QdrantClient _client;
-
+        private readonly bool _ownsClient;
+        private bool _disposed;
 
         /// <summary>
         /// Initializes a new instance of the QdrantEmbeddingStore class using the specified QdrantClient.
         /// </summary>
         /// <param name="client">The QdrantClient instance used to communicate with the Qdrant service.</param>
+        /// <param name="ownsClient">
+        /// If <c>true</c>, the store takes ownership of the client and will dispose it when the store is disposed.
+        /// If <c>false</c> (default), the caller retains ownership and is responsible for disposing the client.
+        /// </param>
         /// <exception cref="ArgumentNullException">Thrown if <paramref name="client"/> is <see langword="null"/>.</exception>
-        public QdrantEmbeddingStore(QdrantClient client)
+        public QdrantEmbeddingStore(QdrantClient client, bool ownsClient = false)
         {
             _client = client ?? throw new ArgumentNullException(nameof(client));
+            _ownsClient = ownsClient;
         }
 
         /// <summary>
@@ -35,6 +41,11 @@ namespace LMKit.Data.Storage.Qdrant
         /// <exception cref="ArgumentNullException">Thrown when <paramref name="address"/> is null.</exception>
         public QdrantEmbeddingStore(Uri address, string apiKey = null, string certificateThumbprint = null)
         {
+            if (address == null)
+            {
+                throw new ArgumentNullException(nameof(address));
+            }
+
             if (!string.IsNullOrWhiteSpace(certificateThumbprint))
             {
                 var channel = QdrantChannel.ForAddress(address,
@@ -49,16 +60,13 @@ namespace LMKit.Data.Storage.Qdrant
             }
             else
             {
-
-                if (address == null)
-                {
-                    throw new ArgumentNullException(nameof(address));
-                }
                 _client = new QdrantClient(
                     host: address.Host,
                     https: address.Scheme == "https",
                     apiKey: apiKey);
             }
+
+            _ownsClient = true;
         }
 
         /// <summary>
@@ -101,11 +109,14 @@ namespace LMKit.Data.Storage.Qdrant
         public QdrantEmbeddingStore(QdrantGrpcClient grpcClient)
         {
             _client = new QdrantClient(grpcClient);
+            _ownsClient = true;
         }
 
         /// <inheritdoc/>
         public async Task<bool> CollectionExistsAsync(string collectionIdentifier, CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
@@ -122,10 +133,13 @@ namespace LMKit.Data.Storage.Qdrant
             IEnumerable<string> payloadIndexFields = null,
             CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
             }
+
             cancellationToken.ThrowIfCancellationRequested();
 
             await _client.CreateCollectionAsync(
@@ -151,6 +165,8 @@ namespace LMKit.Data.Storage.Qdrant
         /// <inheritdoc/>
         public async Task DeleteCollectionAsync(string collectionIdentifier, CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
@@ -163,6 +179,8 @@ namespace LMKit.Data.Storage.Qdrant
         /// <inheritdoc/>
         public async Task<MetadataCollection> GetMetadataAsync(string collectionIdentifier, string id, CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
@@ -207,6 +225,8 @@ namespace LMKit.Data.Storage.Qdrant
         /// <inheritdoc/>
         public async Task<List<PointEntry>> RetrieveFromMetadataAsync(string collectionIdentifier, MetadataCollection metadata, bool getVector, bool getMetadata, CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
@@ -264,6 +284,8 @@ namespace LMKit.Data.Storage.Qdrant
         /// <inheritdoc/>
         public async Task<List<(PointEntry Point, float Score)>> SearchSimilarVectorsAsync(string collectionIdentifier, float[] vector, uint limit, bool getVector, bool getMetadata, CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
@@ -302,7 +324,6 @@ namespace LMKit.Data.Storage.Qdrant
                     }
                 }
                 result.Add((new PointEntry(PointIdToString(entry.Id), entry.Vectors?.Vector?.GetDenseVector().Data, metadataResponse), entry.Score));
-
             }
 
             return result;
@@ -311,6 +332,8 @@ namespace LMKit.Data.Storage.Qdrant
         /// <inheritdoc/>
         public async Task DeleteFromMetadataAsync(string collectionIdentifier, MetadataCollection metadata, CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
@@ -353,6 +376,8 @@ namespace LMKit.Data.Storage.Qdrant
         /// <inheritdoc/>
         public async Task UpsertAsync(string collectionIdentifier, string id, float[] vectors, MetadataCollection metadata, CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
@@ -396,6 +421,8 @@ namespace LMKit.Data.Storage.Qdrant
         /// <inheritdoc/>
         public async Task UpdateMetadataAsync(string collectionIdentifier, string id, MetadataCollection metadata, bool clearFirst, CancellationToken cancellationToken = default)
         {
+            ThrowIfDisposed();
+
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
@@ -412,7 +439,6 @@ namespace LMKit.Data.Storage.Qdrant
             }
 
             cancellationToken.ThrowIfCancellationRequested();
-            // Build payload dictionary using metadata key-value pairs.
             var payload = new Dictionary<string, Value>(metadata.Count);
             foreach (var kv in metadata)
             {
@@ -438,6 +464,36 @@ namespace LMKit.Data.Storage.Qdrant
             if (updateResult.Status != UpdateStatus.Completed)
             {
                 throw new Exception($"Failed to update metadata for collection '{collectionIdentifier}' with id {id}");
+            }
+        }
+
+        /// <summary>
+        /// Releases all resources used by the <see cref="QdrantEmbeddingStore"/>.
+        /// </summary>
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            if (_ownsClient && _client is IDisposable disposableClient)
+            {
+                disposableClient.Dispose();
+            }
+
+            _disposed = true;
+        }
+
+        /// <summary>
+        /// Throws an <see cref="ObjectDisposedException"/> if the store has been disposed.
+        /// </summary>
+        /// <exception cref="ObjectDisposedException">Thrown if the store has been disposed.</exception>
+        private void ThrowIfDisposed()
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(QdrantEmbeddingStore));
             }
         }
 
