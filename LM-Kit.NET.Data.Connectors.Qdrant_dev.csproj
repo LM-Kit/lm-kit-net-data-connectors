@@ -4,11 +4,12 @@
 		<LangVersion>latest</LangVersion>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
-		<Version>2025.4.1</Version>
+		<Version>2026.1.1</Version>
 		<RootNamespace>LMKit.Data.Connectors.Qdrant</RootNamespace>
 		<GenerateDocumentationFile>True</GenerateDocumentationFile>
 		<Configurations>Debug;Release</Configurations>
 		<SignAssembly>True</SignAssembly>
+		<AssemblyName>LM-Kit.NET.Data.Connectors.Qdrant</AssemblyName>
 		<AssemblyOriginatorKeyFile>LMKit.Data.Connectors.Qdrant.snk</AssemblyOriginatorKeyFile>
 	</PropertyGroup>
 
