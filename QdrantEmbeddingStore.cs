@@ -367,10 +367,7 @@ namespace LMKit.Data.Storage.Qdrant
                 cancellationToken: cancellationToken
             );
 
-            if (updateResult.Status != UpdateStatus.Completed)
-            {
-                throw new Exception($"Failed to delete vector from collection '{collectionIdentifier}'");
-            }
+            ThrowIfUpdateFailed(updateResult, $"Failed to delete vector from collection '{collectionIdentifier}'");
         }
 
         /// <inheritdoc/>
@@ -412,10 +409,7 @@ namespace LMKit.Data.Storage.Qdrant
 
             var updateResult = await _client.UpsertAsync(collectionIdentifier, new[] { point }, cancellationToken: cancellationToken);
 
-            if (updateResult.Status != UpdateStatus.Completed)
-            {
-                throw new Exception($"Failed to upsert vector for collection '{collectionIdentifier}' with id {id}");
-            }
+            ThrowIfUpdateFailed(updateResult, $"Failed to upsert vector for collection '{collectionIdentifier}' with id {id}");
         }
 
         /// <inheritdoc/>
@@ -451,20 +445,14 @@ namespace LMKit.Data.Storage.Qdrant
                     ? await _client.ClearPayloadAsync(collectionIdentifier, id: ulong.Parse(id), cancellationToken: cancellationToken)
                     : await _client.ClearPayloadAsync(collectionIdentifier, id: new Guid(id), cancellationToken: cancellationToken);
 
-                if (clearResult.Status != UpdateStatus.Completed)
-                {
-                    throw new Exception($"Failed to clear metadata for collection '{collectionIdentifier}' with id {id}");
-                }
+                ThrowIfUpdateFailed(clearResult, $"Failed to clear metadata for collection '{collectionIdentifier}' with id {id}");
             }
 
             UpdateResult updateResult = IsUintId(id)
                 ? await _client.SetPayloadAsync(collectionIdentifier, payload, id: ulong.Parse(id), cancellationToken: cancellationToken)
                 : await _client.SetPayloadAsync(collectionIdentifier, payload, id: new Guid(id), cancellationToken: cancellationToken);
 
-            if (updateResult.Status != UpdateStatus.Completed)
-            {
-                throw new Exception($"Failed to update metadata for collection '{collectionIdentifier}' with id {id}");
-            }
+            ThrowIfUpdateFailed(updateResult, $"Failed to update metadata for collection '{collectionIdentifier}' with id {id}");
         }
 
         /// <summary>
@@ -494,6 +482,20 @@ namespace LMKit.Data.Storage.Qdrant
             if (_disposed)
             {
                 throw new ObjectDisposedException(nameof(QdrantEmbeddingStore));
+            }
+        }
+
+        /// <summary>
+        /// Validates the result of an update operation and throws an exception if it failed.
+        /// </summary>
+        /// <param name="result">The update result to validate.</param>
+        /// <param name="errorMessage">The error message to include in the exception if validation fails.</param>
+        /// <exception cref="Exception">Thrown when the update operation did not complete or was not acknowledged.</exception>
+        private static void ThrowIfUpdateFailed(UpdateResult result, string errorMessage)
+        {
+            if (result.Status != UpdateStatus.Completed && result.Status != UpdateStatus.Acknowledged)
+            {
+                throw new Exception(errorMessage);
             }
         }
 
