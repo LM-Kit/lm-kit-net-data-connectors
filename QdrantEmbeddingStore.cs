@@ -12,7 +12,7 @@ namespace LMKit.Data.Storage.Qdrant
     {
         private readonly QdrantClient _client;
         private readonly bool _ownsClient;
-        private bool _disposed;
+        private volatile bool _disposed;
 
         /// <summary>
         /// Initializes a new instance of the QdrantEmbeddingStore class using the specified QdrantClient.
@@ -123,7 +123,7 @@ namespace LMKit.Data.Storage.Qdrant
             }
 
             cancellationToken.ThrowIfCancellationRequested();
-            return await _client.CollectionExistsAsync(collectionIdentifier, cancellationToken: cancellationToken);
+            return await _client.CollectionExistsAsync(collectionIdentifier, cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
         /// <inheritdoc/>
@@ -146,7 +146,7 @@ namespace LMKit.Data.Storage.Qdrant
                 collectionIdentifier,
                 new VectorParams { Size = vectorSize, Distance = Distance.Cosine },
                 cancellationToken: cancellationToken
-            );
+            ).ConfigureAwait(false);
 
             if (payloadIndexFields != null)
             {
@@ -157,7 +157,7 @@ namespace LMKit.Data.Storage.Qdrant
                         fieldName,
                         PayloadSchemaType.Keyword,
                         cancellationToken: cancellationToken
-                    );
+                    ).ConfigureAwait(false);
                 }
             }
         }
@@ -173,7 +173,7 @@ namespace LMKit.Data.Storage.Qdrant
             }
 
             cancellationToken.ThrowIfCancellationRequested();
-            await _client.DeleteCollectionAsync(collectionIdentifier, cancellationToken: cancellationToken);
+            await _client.DeleteCollectionAsync(collectionIdentifier, cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
         /// <inheritdoc/>
@@ -197,7 +197,7 @@ namespace LMKit.Data.Storage.Qdrant
 
             if (IsUintId(id))
             {
-                result = await _client.RetrieveAsync(collectionIdentifier, ulong.Parse(id), cancellationToken: cancellationToken);
+                result = await _client.RetrieveAsync(collectionIdentifier, ulong.Parse(id), cancellationToken: cancellationToken).ConfigureAwait(false);
             }
             else
             {
@@ -206,7 +206,7 @@ namespace LMKit.Data.Storage.Qdrant
                     throw new ArgumentException("Invalid GUID format.", nameof(id));
                 }
 
-                result = await _client.RetrieveAsync(collectionIdentifier, guid, cancellationToken: cancellationToken);
+                result = await _client.RetrieveAsync(collectionIdentifier, guid, cancellationToken: cancellationToken).ConfigureAwait(false);
             }
 
             if (result.Count == 0)
@@ -223,7 +223,13 @@ namespace LMKit.Data.Storage.Qdrant
         }
 
         /// <inheritdoc/>
-        public async Task<List<PointEntry>> RetrieveFromMetadataAsync(string collectionIdentifier, MetadataCollection metadata, bool getVector, bool getMetadata, CancellationToken cancellationToken = default)
+        public async Task<List<PointEntry>> RetrieveFromMetadataAsync(
+            string collectionIdentifier,
+            MetadataCollection metadata,
+            bool getVector,
+            bool getMetadata,
+            uint maxResults,
+            CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
 
@@ -237,31 +243,22 @@ namespace LMKit.Data.Storage.Qdrant
                 throw new ArgumentNullException(nameof(metadata));
             }
 
-            cancellationToken.ThrowIfCancellationRequested();
-            var filter = new Filter();
-
-            foreach (var pair in metadata)
+            if (maxResults == 0)
             {
-                var condition = new Condition
-                {
-                    Field = new FieldCondition
-                    {
-                        Key = pair.Key,
-                        Match = new Match { Keyword = pair.Value }
-                    }
-                };
-
-                filter.Must.Add(condition);
+                throw new ArgumentOutOfRangeException(nameof(maxResults), "Max results must be greater than zero.");
             }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            var filter = BuildFilterFromMetadata(metadata);
 
             var queryResult = await _client.QueryAsync(
                 collectionIdentifier,
                 filter: filter,
                 payloadSelector: new WithPayloadSelector() { Enable = getMetadata },
                 vectorsSelector: new WithVectorsSelector() { Enable = getVector },
-                limit: ulong.MaxValue,
+                limit: maxResults,
                 cancellationToken: cancellationToken
-            );
+            ).ConfigureAwait(false);
 
             List<PointEntry> result = new(queryResult.Count);
 
@@ -282,7 +279,14 @@ namespace LMKit.Data.Storage.Qdrant
         }
 
         /// <inheritdoc/>
-        public async Task<List<(PointEntry Point, float Score)>> SearchSimilarVectorsAsync(string collectionIdentifier, float[] vector, uint limit, bool getVector, bool getMetadata, CancellationToken cancellationToken = default)
+        public async Task<List<(PointEntry Point, float Score)>> SearchSimilarVectorsAsync(
+            string collectionIdentifier,
+            float[] vector,
+            uint limit,
+            bool getVector,
+            bool getMetadata,
+            MetadataCollection metadataFilter,
+            CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
 
@@ -302,14 +306,18 @@ namespace LMKit.Data.Storage.Qdrant
             }
 
             cancellationToken.ThrowIfCancellationRequested();
+
+            Filter filter = metadataFilter != null ? BuildFilterFromMetadata(metadataFilter) : null;
+
             var queryResult = await _client.SearchAsync(
                 collectionIdentifier,
                 vector,
+                filter: filter,
                 payloadSelector: new WithPayloadSelector() { Enable = getMetadata },
                 vectorsSelector: new WithVectorsSelector() { Enable = getVector },
                 limit: limit,
                 cancellationToken: cancellationToken
-            );
+            ).ConfigureAwait(false);
 
             List<(PointEntry Point, float Score)> result = new(queryResult.Count);
 
@@ -345,27 +353,13 @@ namespace LMKit.Data.Storage.Qdrant
             }
 
             cancellationToken.ThrowIfCancellationRequested();
-            var filter = new Filter();
-
-            foreach (var pair in metadata)
-            {
-                var condition = new Condition
-                {
-                    Field = new FieldCondition
-                    {
-                        Key = pair.Key,
-                        Match = new Match { Keyword = pair.Value }
-                    }
-                };
-
-                filter.Must.Add(condition);
-            }
+            var filter = BuildFilterFromMetadata(metadata);
 
             var updateResult = await _client.DeleteAsync(
                 collectionIdentifier,
                 filter: filter,
                 cancellationToken: cancellationToken
-            );
+            ).ConfigureAwait(false);
 
             ThrowIfUpdateFailed(updateResult, $"Failed to delete vector from collection '{collectionIdentifier}'");
         }
@@ -404,12 +398,87 @@ namespace LMKit.Data.Storage.Qdrant
 
             foreach (var kv in metadata)
             {
-                point.Payload.Add(kv.Key, kv.Value);
+                point.Payload.Add(kv.Key, new Value { StringValue = kv.Value });
+
             }
 
-            var updateResult = await _client.UpsertAsync(collectionIdentifier, new[] { point }, cancellationToken: cancellationToken);
+            var updateResult = await _client.UpsertAsync(collectionIdentifier, [point], cancellationToken: cancellationToken).ConfigureAwait(false);
 
             ThrowIfUpdateFailed(updateResult, $"Failed to upsert vector for collection '{collectionIdentifier}' with id {id}");
+        }
+
+        /// <summary>
+        /// Upserts multiple vectors with their associated metadata into the specified collection in a single batch operation.
+        /// </summary>
+        /// <param name="collectionIdentifier">The name of the collection to upsert vectors into.</param>
+        /// <param name="points">A collection of tuples containing the ID, vector data, and metadata for each point.</param>
+        /// <param name="cancellationToken">A token to cancel the operation.</param>
+        /// <returns>A task representing the asynchronous operation.</returns>
+        /// <exception cref="ObjectDisposedException">Thrown if the store has been disposed.</exception>
+        /// <exception cref="ArgumentException">Thrown if <paramref name="collectionIdentifier"/> is null or empty.</exception>
+        /// <exception cref="ArgumentNullException">Thrown if <paramref name="points"/> is null.</exception>
+        /// <exception cref="ArgumentException">Thrown if <paramref name="points"/> is empty.</exception>
+        /// <exception cref="InvalidOperationException">Thrown if the upsert operation fails.</exception>
+        public async Task UpsertBatchAsync(
+            string collectionIdentifier,
+            IEnumerable<(string Id, float[] Vectors, MetadataCollection Metadata)> points,
+            CancellationToken cancellationToken = default)
+        {
+            ThrowIfDisposed();
+
+            if (string.IsNullOrWhiteSpace(collectionIdentifier))
+            {
+                throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
+            }
+
+            if (points == null)
+            {
+                throw new ArgumentNullException(nameof(points));
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var pointStructs = new List<PointStruct>();
+
+            foreach (var (id, vectors, metadata) in points)
+            {
+                if (string.IsNullOrWhiteSpace(id))
+                {
+                    throw new ArgumentException("Point ID cannot be null or empty.", nameof(points));
+                }
+
+                if (vectors == null || vectors.Length == 0)
+                {
+                    throw new ArgumentException($"Vector data cannot be null or empty for point with id '{id}'.", nameof(points));
+                }
+
+                if (metadata == null)
+                {
+                    throw new ArgumentNullException(nameof(points), $"Metadata cannot be null for point with id '{id}'.");
+                }
+
+                var point = new PointStruct
+                {
+                    Id = ParsePointId(id),
+                    Vectors = vectors
+                };
+
+                foreach (var kv in metadata)
+                {
+                    point.Payload.Add(kv.Key, new Value { StringValue = kv.Value });
+                }
+
+                pointStructs.Add(point);
+            }
+
+            if (pointStructs.Count == 0)
+            {
+                throw new ArgumentException("Points collection cannot be empty.", nameof(points));
+            }
+
+            var updateResult = await _client.UpsertAsync(collectionIdentifier, pointStructs, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            ThrowIfUpdateFailed(updateResult, $"Failed to batch upsert {pointStructs.Count} vectors into collection '{collectionIdentifier}'");
         }
 
         /// <inheritdoc/>
@@ -442,15 +511,15 @@ namespace LMKit.Data.Storage.Qdrant
             if (clearFirst)
             {
                 UpdateResult clearResult = IsUintId(id)
-                    ? await _client.ClearPayloadAsync(collectionIdentifier, id: ulong.Parse(id), cancellationToken: cancellationToken)
-                    : await _client.ClearPayloadAsync(collectionIdentifier, id: new Guid(id), cancellationToken: cancellationToken);
+                    ? await _client.ClearPayloadAsync(collectionIdentifier, id: ulong.Parse(id), cancellationToken: cancellationToken).ConfigureAwait(false)
+                    : await _client.ClearPayloadAsync(collectionIdentifier, id: new Guid(id), cancellationToken: cancellationToken).ConfigureAwait(false);
 
                 ThrowIfUpdateFailed(clearResult, $"Failed to clear metadata for collection '{collectionIdentifier}' with id {id}");
             }
 
             UpdateResult updateResult = IsUintId(id)
-                ? await _client.SetPayloadAsync(collectionIdentifier, payload, id: ulong.Parse(id), cancellationToken: cancellationToken)
-                : await _client.SetPayloadAsync(collectionIdentifier, payload, id: new Guid(id), cancellationToken: cancellationToken);
+                ? await _client.SetPayloadAsync(collectionIdentifier, payload, id: ulong.Parse(id), cancellationToken: cancellationToken).ConfigureAwait(false)
+                : await _client.SetPayloadAsync(collectionIdentifier, payload, id: new Guid(id), cancellationToken: cancellationToken).ConfigureAwait(false);
 
             ThrowIfUpdateFailed(updateResult, $"Failed to update metadata for collection '{collectionIdentifier}' with id {id}");
         }
@@ -490,13 +559,39 @@ namespace LMKit.Data.Storage.Qdrant
         /// </summary>
         /// <param name="result">The update result to validate.</param>
         /// <param name="errorMessage">The error message to include in the exception if validation fails.</param>
-        /// <exception cref="Exception">Thrown when the update operation did not complete or was not acknowledged.</exception>
+        /// <exception cref="InvalidOperationException">Thrown when the update operation did not complete or was not acknowledged.</exception>
         private static void ThrowIfUpdateFailed(UpdateResult result, string errorMessage)
         {
             if (result.Status != UpdateStatus.Completed && result.Status != UpdateStatus.Acknowledged)
             {
-                throw new Exception(errorMessage);
+                throw new InvalidOperationException($"{errorMessage}. Status: {result.Status}");
             }
+        }
+
+        /// <summary>
+        /// Builds a Qdrant filter from the provided metadata collection.
+        /// </summary>
+        /// <param name="metadata">The metadata to convert into filter conditions.</param>
+        /// <returns>A <see cref="Filter"/> containing must-match conditions for each metadata entry.</returns>
+        private static Filter BuildFilterFromMetadata(MetadataCollection metadata)
+        {
+            var filter = new Filter();
+
+            foreach (var pair in metadata)
+            {
+                var condition = new Condition
+                {
+                    Field = new FieldCondition
+                    {
+                        Key = pair.Key,
+                        Match = new Match { Keyword = pair.Value }
+                    }
+                };
+
+                filter.Must.Add(condition);
+            }
+
+            return filter;
         }
 
         /// <summary>
