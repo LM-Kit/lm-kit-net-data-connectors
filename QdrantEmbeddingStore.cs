@@ -524,6 +524,23 @@ namespace LMKit.Data.Storage.Qdrant
             ThrowIfUpdateFailed(updateResult, $"Failed to update metadata for collection '{collectionIdentifier}' with id {id}");
         }
 
+        /// <inheritdoc/>
+        public async Task<List<string>> ListCollectionsAsync(CancellationToken cancellationToken = default)
+        {
+            ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var collections = await _client.ListCollectionsAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
+            var result = new List<string>(collections.Count);
+
+            foreach (var collection in collections)
+            {
+                result.Add(collection);
+            }
+
+            return result;
+        }
+
         /// <summary>
         /// Releases all resources used by the <see cref="QdrantEmbeddingStore"/>.
         /// </summary>
