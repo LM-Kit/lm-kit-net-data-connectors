@@ -1,5 +1,7 @@
-﻿using Qdrant.Client;
+﻿using System.Globalization;
+using Qdrant.Client;
 using Qdrant.Client.Grpc;
+using QdrantRange = Qdrant.Client.Grpc.Range;
 
 namespace LMKit.Data.Storage.Qdrant
 {
@@ -8,8 +10,32 @@ namespace LMKit.Data.Storage.Qdrant
     /// Provides operations for creating, deleting, updating, and querying vector data with associated metadata,
     /// leveraging Qdrant's vector search capabilities.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Metadata values are stored as string payload fields (the <see cref="MetadataCollection"/> contract).
+    /// To support the typed comparisons of <see cref="MetadataFilter"/> (numeric and date ranges, boolean
+    /// equality) with Qdrant's native range and match conditions, the store additionally writes typed
+    /// shadow payload fields for every metadata value that parses as a number, an ISO 8601 date, or a
+    /// boolean: <c>lmkit_typed_num_&lt;key&gt;</c> (double), <c>lmkit_typed_ts_&lt;key&gt;</c> (Unix epoch
+    /// milliseconds, double), and <c>lmkit_typed_bool_&lt;key&gt;</c> (bool). Shadow fields are maintained
+    /// on upsert and metadata update, hidden from metadata read-back, and used transparently by filter
+    /// translation.
+    /// </para>
+    /// <para>
+    /// Documented limits: typed (number, date, boolean) comparisons only match points written by a store
+    /// version that maintains shadow fields; points written earlier match string comparisons only. Ordinal
+    /// text range comparisons (<c>gt</c>/<c>gte</c>/<c>lt</c>/<c>lte</c> on string values) are not supported
+    /// by Qdrant and throw <see cref="NotSupportedException"/>. Date values are shadowed only when stored
+    /// in ISO 8601 form (starting with <c>yyyy-MM-dd</c>).
+    /// </para>
+    /// </remarks>
     public sealed class QdrantEmbeddingStore : IVectorStore, IDisposable
     {
+        private const string ShadowPrefix = "lmkit_typed_";
+        private const string NumberShadowPrefix = ShadowPrefix + "num_";
+        private const string DateShadowPrefix = ShadowPrefix + "ts_";
+        private const string BooleanShadowPrefix = ShadowPrefix + "bool_";
+
         private readonly QdrantClient _client;
         private readonly bool _ownsClient;
         private volatile bool _disposed;
@@ -158,6 +184,29 @@ namespace LMKit.Data.Storage.Qdrant
                         PayloadSchemaType.Keyword,
                         cancellationToken: cancellationToken
                     ).ConfigureAwait(false);
+
+                    // Typed shadow fields back the MetadataFilter range and boolean comparisons; index
+                    // them alongside the keyword field so typed filters stay indexed on remote servers.
+                    await _client.CreatePayloadIndexAsync(
+                        collectionIdentifier,
+                        NumberShadowPrefix + fieldName,
+                        PayloadSchemaType.Float,
+                        cancellationToken: cancellationToken
+                    ).ConfigureAwait(false);
+
+                    await _client.CreatePayloadIndexAsync(
+                        collectionIdentifier,
+                        DateShadowPrefix + fieldName,
+                        PayloadSchemaType.Float,
+                        cancellationToken: cancellationToken
+                    ).ConfigureAwait(false);
+
+                    await _client.CreatePayloadIndexAsync(
+                        collectionIdentifier,
+                        BooleanShadowPrefix + fieldName,
+                        PayloadSchemaType.Bool,
+                        cancellationToken: cancellationToken
+                    ).ConfigureAwait(false);
                 }
             }
         }
@@ -216,19 +265,53 @@ namespace LMKit.Data.Storage.Qdrant
 
             foreach (var pair in result[0].Payload)
             {
-                metadata.Add(PayloadEntryToMetadata(pair));
+                if (!IsShadowKey(pair.Key))
+                {
+                    metadata.Add(PayloadEntryToMetadata(pair));
+                }
             }
 
             return metadata;
         }
 
         /// <inheritdoc/>
-        public async Task<List<PointEntry>> RetrieveFromMetadataAsync(
+        public Task<List<PointEntry>> RetrieveFromMetadataAsync(
             string collectionIdentifier,
             MetadataCollection metadata,
             VectorRetrievalOptions options,
             uint maxResults,
             CancellationToken cancellationToken = default)
+        {
+            if (metadata == null)
+            {
+                throw new ArgumentNullException(nameof(metadata));
+            }
+
+            return RetrieveCoreAsync(collectionIdentifier, BuildFilterFromMetadata(metadata), options, maxResults, cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        public Task<List<PointEntry>> RetrieveFromMetadataAsync(
+            string collectionIdentifier,
+            MetadataFilter filter,
+            VectorRetrievalOptions options,
+            uint maxResults,
+            CancellationToken cancellationToken = default)
+        {
+            if (filter == null)
+            {
+                throw new ArgumentNullException(nameof(filter));
+            }
+
+            return RetrieveCoreAsync(collectionIdentifier, TranslateFilter(filter), options, maxResults, cancellationToken);
+        }
+
+        private async Task<List<PointEntry>> RetrieveCoreAsync(
+            string collectionIdentifier,
+            Filter filter,
+            VectorRetrievalOptions options,
+            uint maxResults,
+            CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
 
@@ -237,18 +320,12 @@ namespace LMKit.Data.Storage.Qdrant
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
             }
 
-            if (metadata == null)
-            {
-                throw new ArgumentNullException(nameof(metadata));
-            }
-
             if (maxResults == 0)
             {
                 throw new ArgumentOutOfRangeException(nameof(maxResults), "Max results must be greater than zero.");
             }
 
             cancellationToken.ThrowIfCancellationRequested();
-            var filter = BuildFilterFromMetadata(metadata);
 
             var queryResult = await _client.QueryAsync(
                 collectionIdentifier,
@@ -263,28 +340,45 @@ namespace LMKit.Data.Storage.Qdrant
 
             foreach (var entry in queryResult)
             {
-                MetadataCollection metadataResponse = [];
-                if (entry.Payload != null)
-                {
-                    foreach (var pair in entry.Payload)
-                    {
-                        metadataResponse.Add(PayloadEntryToMetadata(pair));
-                    }
-                }
-                result.Add(new PointEntry(PointIdToString(entry.Id), entry.Vectors?.Vector?.GetDenseVector().Data, metadataResponse));
+                result.Add(new PointEntry(PointIdToString(entry.Id), entry.Vectors?.Vector?.GetDenseVector().Data, PayloadToMetadata(entry.Payload)));
             }
 
             return result;
         }
 
         /// <inheritdoc/>
-        public async Task<List<(PointEntry Point, float Score)>> SearchSimilarVectorsAsync(
+        public Task<List<(PointEntry Point, float Score)>> SearchSimilarVectorsAsync(
             string collectionIdentifier,
             float[] vector,
             uint limit,
             VectorRetrievalOptions options,
             MetadataCollection metadataFilter,
             CancellationToken cancellationToken = default)
+        {
+            Filter filter = metadataFilter != null ? BuildFilterFromMetadata(metadataFilter) : null;
+            return SearchCoreAsync(collectionIdentifier, vector, limit, options, filter, cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        public Task<List<(PointEntry Point, float Score)>> SearchSimilarVectorsAsync(
+            string collectionIdentifier,
+            float[] vector,
+            uint limit,
+            VectorRetrievalOptions options,
+            MetadataFilter filter,
+            CancellationToken cancellationToken = default)
+        {
+            Filter translated = filter != null ? TranslateFilter(filter) : null;
+            return SearchCoreAsync(collectionIdentifier, vector, limit, options, translated, cancellationToken);
+        }
+
+        private async Task<List<(PointEntry Point, float Score)>> SearchCoreAsync(
+            string collectionIdentifier,
+            float[] vector,
+            uint limit,
+            VectorRetrievalOptions options,
+            Filter filter,
+            CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
 
@@ -305,8 +399,6 @@ namespace LMKit.Data.Storage.Qdrant
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            Filter filter = metadataFilter != null ? BuildFilterFromMetadata(metadataFilter) : null;
-
             var queryResult = await _client.SearchAsync(
                 collectionIdentifier,
                 vector,
@@ -321,22 +413,35 @@ namespace LMKit.Data.Storage.Qdrant
 
             foreach (var entry in queryResult)
             {
-                MetadataCollection metadataResponse = [];
-                if (entry.Payload != null)
-                {
-                    foreach (var pair in entry.Payload)
-                    {
-                        metadataResponse.Add(PayloadEntryToMetadata(pair));
-                    }
-                }
-                result.Add((new PointEntry(PointIdToString(entry.Id), entry.Vectors?.Vector?.GetDenseVector().Data, metadataResponse), entry.Score));
+                result.Add((new PointEntry(PointIdToString(entry.Id), entry.Vectors?.Vector?.GetDenseVector().Data, PayloadToMetadata(entry.Payload)), entry.Score));
             }
 
             return result;
         }
 
         /// <inheritdoc/>
-        public async Task DeleteFromMetadataAsync(string collectionIdentifier, MetadataCollection metadata, CancellationToken cancellationToken = default)
+        public Task DeleteFromMetadataAsync(string collectionIdentifier, MetadataCollection metadata, CancellationToken cancellationToken = default)
+        {
+            if (metadata == null)
+            {
+                throw new ArgumentNullException(nameof(metadata));
+            }
+
+            return DeleteCoreAsync(collectionIdentifier, BuildFilterFromMetadata(metadata), cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        public Task DeleteFromMetadataAsync(string collectionIdentifier, MetadataFilter filter, CancellationToken cancellationToken = default)
+        {
+            if (filter == null)
+            {
+                throw new ArgumentNullException(nameof(filter));
+            }
+
+            return DeleteCoreAsync(collectionIdentifier, TranslateFilter(filter), cancellationToken);
+        }
+
+        private async Task DeleteCoreAsync(string collectionIdentifier, Filter filter, CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
 
@@ -345,13 +450,7 @@ namespace LMKit.Data.Storage.Qdrant
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
             }
 
-            if (metadata == null)
-            {
-                throw new ArgumentNullException(nameof(metadata));
-            }
-
             cancellationToken.ThrowIfCancellationRequested();
-            var filter = BuildFilterFromMetadata(metadata);
 
             var updateResult = await _client.DeleteAsync(
                 collectionIdentifier,
@@ -396,8 +495,7 @@ namespace LMKit.Data.Storage.Qdrant
 
             foreach (var kv in metadata)
             {
-                point.Payload.Add(kv.Key, new Value { StringValue = kv.Value });
-
+                AddPayloadEntryWithShadows(point.Payload, kv.Key, kv.Value);
             }
 
             var updateResult = await _client.UpsertAsync(collectionIdentifier, [point], cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -463,7 +561,7 @@ namespace LMKit.Data.Storage.Qdrant
 
                 foreach (var kv in metadata)
                 {
-                    point.Payload.Add(kv.Key, new Value { StringValue = kv.Value });
+                    AddPayloadEntryWithShadows(point.Payload, kv.Key, kv.Value);
                 }
 
                 pointStructs.Add(point);
@@ -503,7 +601,7 @@ namespace LMKit.Data.Storage.Qdrant
             var payload = new Dictionary<string, Value>(metadata.Count);
             foreach (var kv in metadata)
             {
-                payload.Add(kv.Key, new Value { StringValue = kv.Value });
+                AddPayloadEntryWithShadows(payload, kv.Key, kv.Value);
             }
 
             if (mode == MetadataUpdateMode.Replace)
@@ -513,6 +611,37 @@ namespace LMKit.Data.Storage.Qdrant
                     : await _client.ClearPayloadAsync(collectionIdentifier, id: new Guid(id), cancellationToken: cancellationToken).ConfigureAwait(false);
 
                 ThrowIfUpdateFailed(clearResult, $"Failed to clear metadata for collection '{collectionIdentifier}' with id {id}");
+            }
+            else
+            {
+                // Merge keeps the point's existing payload, so a key whose new value no longer parses in
+                // a typed domain must have its stale shadow fields removed, or old typed filters would
+                // keep matching the outdated value.
+                var staleShadowKeys = new List<string>();
+                foreach (var kv in metadata)
+                {
+                    if (IsShadowKey(kv.Key))
+                    {
+                        continue;
+                    }
+
+                    foreach (string shadowKey in new[] { NumberShadowPrefix + kv.Key, DateShadowPrefix + kv.Key, BooleanShadowPrefix + kv.Key })
+                    {
+                        if (!payload.ContainsKey(shadowKey))
+                        {
+                            staleShadowKeys.Add(shadowKey);
+                        }
+                    }
+                }
+
+                if (staleShadowKeys.Count > 0)
+                {
+                    UpdateResult deleteResult = IsUintId(id)
+                        ? await _client.DeletePayloadAsync(collectionIdentifier, staleShadowKeys, id: ulong.Parse(id), cancellationToken: cancellationToken).ConfigureAwait(false)
+                        : await _client.DeletePayloadAsync(collectionIdentifier, staleShadowKeys, id: new Guid(id), cancellationToken: cancellationToken).ConfigureAwait(false);
+
+                    ThrowIfUpdateFailed(deleteResult, $"Failed to remove stale typed metadata for collection '{collectionIdentifier}' with id {id}");
+                }
             }
 
             UpdateResult updateResult = IsUintId(id)
@@ -607,6 +736,308 @@ namespace LMKit.Data.Storage.Qdrant
             }
 
             return filter;
+        }
+
+        /// <summary>
+        /// Determines whether a payload key is a typed shadow field maintained by this store
+        /// (never surfaced as metadata).
+        /// </summary>
+        private static bool IsShadowKey(string key)
+        {
+            return key != null && key.StartsWith(ShadowPrefix, StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Adds a metadata entry to a payload as a string field, plus the typed shadow fields for every
+        /// domain the value parses in: a double under <c>lmkit_typed_num_&lt;key&gt;</c>, Unix epoch
+        /// milliseconds under <c>lmkit_typed_ts_&lt;key&gt;</c> (ISO 8601 values only), and a bool under
+        /// <c>lmkit_typed_bool_&lt;key&gt;</c>. The shadows are what Qdrant's native range and boolean
+        /// conditions can filter on, since the primary field is a string.
+        /// </summary>
+        private static void AddPayloadEntryWithShadows(IDictionary<string, Value> payload, string key, string value)
+        {
+            payload[key] = new Value { StringValue = value };
+
+            if (IsShadowKey(key) || string.IsNullOrEmpty(value))
+            {
+                return;
+            }
+
+            string trimmed = value.Trim();
+
+            if (double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out double number) &&
+                !double.IsNaN(number) && !double.IsInfinity(number))
+            {
+                payload[NumberShadowPrefix + key] = new Value { DoubleValue = number };
+            }
+
+            if (bool.TryParse(trimmed, out bool boolean))
+            {
+                payload[BooleanShadowPrefix + key] = new Value { BoolValue = boolean };
+            }
+
+            if (LooksLikeIsoDate(trimmed) &&
+                DateTimeOffset.TryParse(trimmed, CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out DateTimeOffset date))
+            {
+                payload[DateShadowPrefix + key] = new Value { DoubleValue = date.ToUnixTimeMilliseconds() };
+            }
+        }
+
+        /// <summary>
+        /// Cheap shape check that gates date shadowing to ISO 8601 values (<c>yyyy-MM-dd...</c>), so
+        /// free-form text that a lenient date parser would accept is not misread as a timestamp.
+        /// </summary>
+        private static bool LooksLikeIsoDate(string value)
+        {
+            if (value.Length < 10 || value[4] != '-' || value[7] != '-')
+            {
+                return false;
+            }
+
+            for (int i = 0; i < 10; i++)
+            {
+                if (i == 4 || i == 7)
+                {
+                    continue;
+                }
+
+                if (value[i] < '0' || value[i] > '9')
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Converts a point's payload to a <see cref="MetadataCollection"/>, hiding the typed shadow fields.
+        /// </summary>
+        private static MetadataCollection PayloadToMetadata(IEnumerable<KeyValuePair<string, Value>> payload)
+        {
+            MetadataCollection metadata = [];
+
+            if (payload != null)
+            {
+                foreach (var pair in payload)
+                {
+                    if (!IsShadowKey(pair.Key))
+                    {
+                        metadata.Add(PayloadEntryToMetadata(pair));
+                    }
+                }
+            }
+
+            return metadata;
+        }
+
+        /// <summary>
+        /// Translates a <see cref="MetadataFilter"/> tree into a native Qdrant <see cref="Filter"/>.
+        /// String comparisons match the primary string field; numeric, date, and boolean comparisons
+        /// target the typed shadow fields, so they only match points written with shadow maintenance.
+        /// Every comparison except <c>exists(false)</c> requires the (typed) field to be present, so a
+        /// missing key, or a value that does not parse in the requested domain, never matches, mirroring
+        /// <see cref="MetadataFilter.Matches"/>.
+        /// </summary>
+        /// <exception cref="NotSupportedException">
+        /// Thrown for ordinal text range comparisons (gt/gte/lt/lte on string values), which Qdrant
+        /// cannot evaluate.
+        /// </exception>
+        private static Filter TranslateFilter(MetadataFilter filter)
+        {
+            return new Filter { Must = { TranslateNode(filter) } };
+        }
+
+        private static Condition TranslateNode(MetadataFilter node)
+        {
+            if (node is MetadataFilter.Composite composite)
+            {
+                var inner = new Filter();
+                var target = composite.Operator == MetadataFilterOperator.And ? inner.Must : inner.Should;
+                foreach (MetadataFilter child in composite.Filters)
+                {
+                    target.Add(TranslateNode(child));
+                }
+
+                return new Condition { Filter = inner };
+            }
+
+            var comparison = (MetadataFilter.Comparison)node;
+            string key = comparison.Key;
+
+            if (comparison.Operator == MetadataFilterOperator.Exists)
+            {
+                return comparison.Values[0].BooleanValue
+                    ? new Condition { Filter = new Filter { MustNot = { EmptyCondition(key) } } }
+                    : EmptyCondition(key);
+            }
+
+            switch (comparison.Values[0].Kind)
+            {
+                case MetadataFilterValueKind.Number:
+                    return TranslateRangeComparison(NumberShadowPrefix + key, comparison, value => value.NumberValue);
+
+                case MetadataFilterValueKind.Date:
+                    return TranslateRangeComparison(DateShadowPrefix + key, comparison, value => value.DateValue.ToUnixTimeMilliseconds());
+
+                case MetadataFilterValueKind.Boolean:
+                    return TranslateBooleanComparison(BooleanShadowPrefix + key, comparison);
+
+                default:
+                    return TranslateStringComparison(key, comparison);
+            }
+        }
+
+        private static Condition TranslateStringComparison(string key, MetadataFilter.Comparison comparison)
+        {
+            switch (comparison.Operator)
+            {
+                case MetadataFilterOperator.Equal:
+                    return MatchKeyword(key, comparison.Values[0].StringValue);
+
+                case MetadataFilterOperator.NotEqual:
+                    return PresentAndNoneOf(key, MatchKeyword(key, comparison.Values[0].StringValue));
+
+                case MetadataFilterOperator.In:
+                    return MatchAnyKeyword(key, comparison.Values);
+
+                case MetadataFilterOperator.NotIn:
+                    return PresentAndNoneOf(key, MatchAnyKeyword(key, comparison.Values));
+
+                default:
+                    throw new NotSupportedException(
+                        "Ordinal text range comparisons (gt, gte, lt, lte on string values) are not supported by the " +
+                        "Qdrant connector. Use a numeric or date-typed filter value, or restructure the filter.");
+            }
+        }
+
+        private static Condition TranslateRangeComparison(
+            string shadowKey, MetadataFilter.Comparison comparison, Func<MetadataFilterValue, double> convert)
+        {
+            switch (comparison.Operator)
+            {
+                case MetadataFilterOperator.Equal:
+                    return RangeCondition(shadowKey, new QdrantRange { Gte = convert(comparison.Values[0]), Lte = convert(comparison.Values[0]) });
+
+                case MetadataFilterOperator.NotEqual:
+                    return PresentAndNoneOf(shadowKey,
+                        RangeCondition(shadowKey, new QdrantRange { Gte = convert(comparison.Values[0]), Lte = convert(comparison.Values[0]) }));
+
+                case MetadataFilterOperator.GreaterThan:
+                    return RangeCondition(shadowKey, new QdrantRange { Gt = convert(comparison.Values[0]) });
+
+                case MetadataFilterOperator.GreaterThanOrEqual:
+                    return RangeCondition(shadowKey, new QdrantRange { Gte = convert(comparison.Values[0]) });
+
+                case MetadataFilterOperator.LessThan:
+                    return RangeCondition(shadowKey, new QdrantRange { Lt = convert(comparison.Values[0]) });
+
+                case MetadataFilterOperator.LessThanOrEqual:
+                    return RangeCondition(shadowKey, new QdrantRange { Lte = convert(comparison.Values[0]) });
+
+                case MetadataFilterOperator.In:
+                {
+                    var any = new Filter();
+                    foreach (MetadataFilterValue value in comparison.Values)
+                    {
+                        any.Should.Add(RangeCondition(shadowKey, new QdrantRange { Gte = convert(value), Lte = convert(value) }));
+                    }
+
+                    return new Condition { Filter = any };
+                }
+
+                default: // NotIn
+                {
+                    var matches = new Condition[comparison.Values.Count];
+                    for (int i = 0; i < comparison.Values.Count; i++)
+                    {
+                        matches[i] = RangeCondition(shadowKey, new QdrantRange { Gte = convert(comparison.Values[i]), Lte = convert(comparison.Values[i]) });
+                    }
+
+                    return PresentAndNoneOf(shadowKey, matches);
+                }
+            }
+        }
+
+        private static Condition TranslateBooleanComparison(string shadowKey, MetadataFilter.Comparison comparison)
+        {
+            switch (comparison.Operator)
+            {
+                case MetadataFilterOperator.Equal:
+                    return MatchBoolean(shadowKey, comparison.Values[0].BooleanValue);
+
+                case MetadataFilterOperator.NotEqual:
+                    return PresentAndNoneOf(shadowKey, MatchBoolean(shadowKey, comparison.Values[0].BooleanValue));
+
+                case MetadataFilterOperator.In:
+                {
+                    var any = new Filter();
+                    foreach (MetadataFilterValue value in comparison.Values)
+                    {
+                        any.Should.Add(MatchBoolean(shadowKey, value.BooleanValue));
+                    }
+
+                    return new Condition { Filter = any };
+                }
+
+                default: // NotIn (range operators over booleans are rejected at filter construction)
+                {
+                    var matches = new Condition[comparison.Values.Count];
+                    for (int i = 0; i < comparison.Values.Count; i++)
+                    {
+                        matches[i] = MatchBoolean(shadowKey, comparison.Values[i].BooleanValue);
+                    }
+
+                    return PresentAndNoneOf(shadowKey, matches);
+                }
+            }
+        }
+
+        private static Condition EmptyCondition(string key)
+        {
+            return new Condition { IsEmpty = new IsEmptyCondition { Key = key } };
+        }
+
+        private static Condition MatchKeyword(string key, string value)
+        {
+            return new Condition { Field = new FieldCondition { Key = key, Match = new Match { Keyword = value } } };
+        }
+
+        private static Condition MatchAnyKeyword(string key, IReadOnlyList<MetadataFilterValue> values)
+        {
+            var keywords = new RepeatedStrings();
+            foreach (MetadataFilterValue value in values)
+            {
+                keywords.Strings.Add(value.StringValue);
+            }
+
+            return new Condition { Field = new FieldCondition { Key = key, Match = new Match { Keywords = keywords } } };
+        }
+
+        private static Condition MatchBoolean(string key, bool value)
+        {
+            return new Condition { Field = new FieldCondition { Key = key, Match = new Match { Boolean = value } } };
+        }
+
+        private static Condition RangeCondition(string key, QdrantRange range)
+        {
+            return new Condition { Field = new FieldCondition { Key = key, Range = range } };
+        }
+
+        /// <summary>
+        /// Builds the "key is present and none of the given conditions match" filter used for negative
+        /// comparisons (<c>ne</c>, <c>nin</c>): the field must exist (a missing key never matches, even
+        /// negatively) and every listed positive match is excluded.
+        /// </summary>
+        private static Condition PresentAndNoneOf(string key, params Condition[] conditions)
+        {
+            var filter = new Filter { MustNot = { EmptyCondition(key) } };
+            foreach (Condition condition in conditions)
+            {
+                filter.MustNot.Add(condition);
+            }
+
+            return new Condition { Filter = filter };
         }
 
         /// <summary>

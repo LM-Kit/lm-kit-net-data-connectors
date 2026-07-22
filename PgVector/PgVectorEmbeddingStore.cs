@@ -20,7 +20,8 @@ namespace LMKit.Data.Storage.PgVector
     /// </para>
     /// <para>
     /// Similarity is computed with the cosine distance operator (<c>&lt;=&gt;</c>). Scores returned by
-    /// <see cref="SearchSimilarVectorsAsync"/> are cosine similarities (<c>1 - cosine_distance</c>), so a higher
+    /// <see cref="SearchSimilarVectorsAsync(string, float[], uint, VectorRetrievalOptions, MetadataCollection, CancellationToken)"/>
+    /// are cosine similarities (<c>1 - cosine_distance</c>), so a higher
     /// score means a closer match, consistent with the other <see cref="IVectorStore"/> implementations.
     /// </para>
     /// <para>
@@ -37,6 +38,8 @@ namespace LMKit.Data.Storage.PgVector
         private readonly bool _ownsDataSource;
         private readonly string _schema;
         private volatile bool _disposed;
+        private volatile bool _typedCastHelpersEnsured;
+        private readonly SemaphoreSlim _typedCastHelpersGate = new SemaphoreSlim(1, 1);
 
         /// <summary>
         /// Initializes a new instance of the <see cref="PgVectorEmbeddingStore"/> class using the specified
@@ -295,23 +298,55 @@ namespace LMKit.Data.Storage.PgVector
         }
 
         /// <inheritdoc/>
-        public async Task<List<PointEntry>> RetrieveFromMetadataAsync(
+        public Task<List<PointEntry>> RetrieveFromMetadataAsync(
             string collectionIdentifier,
             MetadataCollection metadata,
             VectorRetrievalOptions options,
             uint maxResults,
             CancellationToken cancellationToken = default)
         {
+            if (metadata == null)
+            {
+                throw new ArgumentNullException(nameof(metadata));
+            }
+
+            return RetrieveCoreAsync(
+                collectionIdentifier,
+                command => new TranslatedFilter { Conditions = AppendMetadataConditions(metadata, command) },
+                options, maxResults, cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        public Task<List<PointEntry>> RetrieveFromMetadataAsync(
+            string collectionIdentifier,
+            MetadataFilter filter,
+            VectorRetrievalOptions options,
+            uint maxResults,
+            CancellationToken cancellationToken = default)
+        {
+            if (filter == null)
+            {
+                throw new ArgumentNullException(nameof(filter));
+            }
+
+            return RetrieveCoreAsync(
+                collectionIdentifier,
+                command => TranslateFilter(filter, command),
+                options, maxResults, cancellationToken);
+        }
+
+        private async Task<List<PointEntry>> RetrieveCoreAsync(
+            string collectionIdentifier,
+            Func<NpgsqlCommand, TranslatedFilter> filterBuilder,
+            VectorRetrievalOptions options,
+            uint maxResults,
+            CancellationToken cancellationToken)
+        {
             ThrowIfDisposed();
 
             if (string.IsNullOrWhiteSpace(collectionIdentifier))
             {
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
-            }
-
-            if (metadata == null)
-            {
-                throw new ArgumentNullException(nameof(metadata));
             }
 
             if (maxResults == 0)
@@ -323,6 +358,12 @@ namespace LMKit.Data.Storage.PgVector
 
             using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
             using var command = new NpgsqlCommand { Connection = connection };
+
+            TranslatedFilter filter = filterBuilder(command);
+            if (filter.NeedsTypedCastHelpers)
+            {
+                await EnsureTypedCastHelpersAsync(connection, cancellationToken).ConfigureAwait(false);
+            }
 
             bool getVector = (options & VectorRetrievalOptions.IncludeVector) != 0;
             bool getMetadata = (options & VectorRetrievalOptions.IncludeMetadata) != 0;
@@ -346,10 +387,9 @@ namespace LMKit.Data.Storage.PgVector
 
             query.Append(" FROM ").Append(TableReference(collectionIdentifier));
 
-            string conditions = AppendMetadataConditions(metadata, command);
-            if (conditions.Length > 0)
+            if (filter.Conditions.Length > 0)
             {
-                query.Append(" WHERE ").Append(conditions);
+                query.Append(" WHERE ").Append(filter.Conditions);
             }
 
             query.Append(" LIMIT @limit");
@@ -368,13 +408,44 @@ namespace LMKit.Data.Storage.PgVector
         }
 
         /// <inheritdoc/>
-        public async Task<List<(PointEntry Point, float Score)>> SearchSimilarVectorsAsync(
+        public Task<List<(PointEntry Point, float Score)>> SearchSimilarVectorsAsync(
             string collectionIdentifier,
             float[] vector,
             uint limit,
             VectorRetrievalOptions options,
             MetadataCollection metadataFilter,
             CancellationToken cancellationToken = default)
+        {
+            return SearchCoreAsync(
+                collectionIdentifier, vector, limit, options,
+                command => metadataFilter != null
+                    ? new TranslatedFilter { Conditions = AppendMetadataConditions(metadataFilter, command) }
+                    : new TranslatedFilter(),
+                cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        public Task<List<(PointEntry Point, float Score)>> SearchSimilarVectorsAsync(
+            string collectionIdentifier,
+            float[] vector,
+            uint limit,
+            VectorRetrievalOptions options,
+            MetadataFilter filter,
+            CancellationToken cancellationToken = default)
+        {
+            return SearchCoreAsync(
+                collectionIdentifier, vector, limit, options,
+                command => filter != null ? TranslateFilter(filter, command) : new TranslatedFilter(),
+                cancellationToken);
+        }
+
+        private async Task<List<(PointEntry Point, float Score)>> SearchCoreAsync(
+            string collectionIdentifier,
+            float[] vector,
+            uint limit,
+            VectorRetrievalOptions options,
+            Func<NpgsqlCommand, TranslatedFilter> filterBuilder,
+            CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
 
@@ -398,6 +469,12 @@ namespace LMKit.Data.Storage.PgVector
             using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
             using var command = new NpgsqlCommand { Connection = connection };
             command.Parameters.AddWithValue("query", FormatVector(vector));
+
+            TranslatedFilter filter = filterBuilder(command);
+            if (filter.NeedsTypedCastHelpers)
+            {
+                await EnsureTypedCastHelpersAsync(connection, cancellationToken).ConfigureAwait(false);
+            }
 
             bool getVector = (options & VectorRetrievalOptions.IncludeVector) != 0;
             bool getMetadata = (options & VectorRetrievalOptions.IncludeMetadata) != 0;
@@ -423,13 +500,9 @@ namespace LMKit.Data.Storage.PgVector
             query.Append(", 1 - (embedding <=> @query::vector) AS score");
             query.Append(" FROM ").Append(TableReference(collectionIdentifier));
 
-            if (metadataFilter != null)
+            if (filter.Conditions.Length > 0)
             {
-                string conditions = AppendMetadataConditions(metadataFilter, command);
-                if (conditions.Length > 0)
-                {
-                    query.Append(" WHERE ").Append(conditions);
-                }
+                query.Append(" WHERE ").Append(filter.Conditions);
             }
 
             query.Append(" ORDER BY embedding <=> @query::vector LIMIT @limit");
@@ -450,7 +523,37 @@ namespace LMKit.Data.Storage.PgVector
         }
 
         /// <inheritdoc/>
-        public async Task DeleteFromMetadataAsync(string collectionIdentifier, MetadataCollection metadata, CancellationToken cancellationToken = default)
+        public Task DeleteFromMetadataAsync(string collectionIdentifier, MetadataCollection metadata, CancellationToken cancellationToken = default)
+        {
+            if (metadata == null)
+            {
+                throw new ArgumentNullException(nameof(metadata));
+            }
+
+            return DeleteCoreAsync(
+                collectionIdentifier,
+                command => new TranslatedFilter { Conditions = AppendMetadataConditions(metadata, command) },
+                cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        public Task DeleteFromMetadataAsync(string collectionIdentifier, MetadataFilter filter, CancellationToken cancellationToken = default)
+        {
+            if (filter == null)
+            {
+                throw new ArgumentNullException(nameof(filter));
+            }
+
+            return DeleteCoreAsync(
+                collectionIdentifier,
+                command => TranslateFilter(filter, command),
+                cancellationToken);
+        }
+
+        private async Task DeleteCoreAsync(
+            string collectionIdentifier,
+            Func<NpgsqlCommand, TranslatedFilter> filterBuilder,
+            CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
 
@@ -459,19 +562,19 @@ namespace LMKit.Data.Storage.PgVector
                 throw new ArgumentException("Collection identifier cannot be null or empty.", nameof(collectionIdentifier));
             }
 
-            if (metadata == null)
-            {
-                throw new ArgumentNullException(nameof(metadata));
-            }
-
             cancellationToken.ThrowIfCancellationRequested();
 
             using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
             using var command = new NpgsqlCommand { Connection = connection };
 
-            string conditions = AppendMetadataConditions(metadata, command);
-            command.CommandText = conditions.Length > 0
-                ? $"DELETE FROM {TableReference(collectionIdentifier)} WHERE {conditions}"
+            TranslatedFilter filter = filterBuilder(command);
+            if (filter.NeedsTypedCastHelpers)
+            {
+                await EnsureTypedCastHelpersAsync(connection, cancellationToken).ConfigureAwait(false);
+            }
+
+            command.CommandText = filter.Conditions.Length > 0
+                ? $"DELETE FROM {TableReference(collectionIdentifier)} WHERE {filter.Conditions}"
                 : $"DELETE FROM {TableReference(collectionIdentifier)}";
 
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -701,6 +804,7 @@ namespace LMKit.Data.Storage.PgVector
                 _dataSource.Dispose();
             }
 
+            _typedCastHelpersGate.Dispose();
             _disposed = true;
         }
 
@@ -780,6 +884,217 @@ namespace LMKit.Data.Storage.PgVector
             }
 
             return builder.ToString();
+        }
+
+        /// <summary>
+        /// A metadata filter rendered as a SQL fragment, with the flag indicating whether the fragment
+        /// references the typed-cast helper functions (which must exist before the query runs).
+        /// </summary>
+        private sealed class TranslatedFilter
+        {
+            public string Conditions = string.Empty;
+            public bool NeedsTypedCastHelpers;
+            public int ParameterIndex;
+        }
+
+        /// <summary>
+        /// Renders a <see cref="MetadataFilter"/> tree as a parameterized SQL condition over the
+        /// <c>metadata</c> jsonb column, mirroring the in-memory <see cref="MetadataFilter.Matches"/>
+        /// semantics: text compares ordinally (byte order via <c>COLLATE "C"</c>), numbers and ISO 8601
+        /// dates go through exception-safe cast helpers so a stored value that does not parse in the
+        /// requested domain never matches (and never fails the query), and every comparison except
+        /// <c>exists(false)</c> requires the key to be present.
+        /// </summary>
+        /// <param name="filter">The filter tree to translate.</param>
+        /// <param name="command">The command to which parameter values are bound.</param>
+        /// <returns>The translated filter fragment.</returns>
+        private TranslatedFilter TranslateFilter(MetadataFilter filter, NpgsqlCommand command)
+        {
+            var result = new TranslatedFilter();
+            result.Conditions = TranslateNode(filter, command, result);
+            return result;
+        }
+
+        private string TranslateNode(MetadataFilter node, NpgsqlCommand command, TranslatedFilter state)
+        {
+            if (node is MetadataFilter.Composite composite)
+            {
+                var parts = new List<string>(composite.Filters.Count);
+                foreach (MetadataFilter child in composite.Filters)
+                {
+                    parts.Add(TranslateNode(child, command, state));
+                }
+
+                string separator = composite.Operator == MetadataFilterOperator.And ? " AND " : " OR ";
+                return "(" + string.Join(separator, parts) + ")";
+            }
+
+            var comparison = (MetadataFilter.Comparison)node;
+            string keyLiteral = "'" + EscapeStringLiteral(comparison.Key) + "'";
+            string accessor = "metadata ->> " + keyLiteral;
+
+            if (comparison.Operator == MetadataFilterOperator.Exists)
+            {
+                return comparison.Values[0].BooleanValue
+                    ? "(metadata ? " + keyLiteral + ")"
+                    : "(NOT (metadata ? " + keyLiteral + "))";
+            }
+
+            // The stored value, interpreted in the filter value's domain. An uninterpretable stored
+            // value (or a missing key) yields SQL NULL, and every comparison below propagates NULL,
+            // which the surrounding WHERE / NOT treats as "no match".
+            MetadataFilterValueKind kind = comparison.Values[0].Kind;
+            string stored;
+            switch (kind)
+            {
+                case MetadataFilterValueKind.Number:
+                    state.NeedsTypedCastHelpers = true;
+                    stored = TypedCastFunctionReference("lmkit_try_numeric") + "(" + accessor + ")::float8";
+                    break;
+                case MetadataFilterValueKind.Date:
+                    state.NeedsTypedCastHelpers = true;
+                    stored = TypedCastFunctionReference("lmkit_try_timestamptz") + "(" + accessor + ")";
+                    break;
+                case MetadataFilterValueKind.Boolean:
+                    stored = "(CASE WHEN lower(btrim(" + accessor + ")) IN ('true','false') THEN btrim(" + accessor + ")::boolean END)";
+                    break;
+                default:
+                    bool ordinalRange = comparison.Operator is MetadataFilterOperator.GreaterThan
+                        or MetadataFilterOperator.GreaterThanOrEqual
+                        or MetadataFilterOperator.LessThan
+                        or MetadataFilterOperator.LessThanOrEqual;
+                    stored = ordinalRange ? "((" + accessor + ") COLLATE \"C\")" : "(" + accessor + ")";
+                    break;
+            }
+
+            if (comparison.Operator is MetadataFilterOperator.In or MetadataFilterOperator.NotIn)
+            {
+                string arrayParameter = BindArrayParameter(comparison.Values, kind, command, state);
+                return comparison.Operator == MetadataFilterOperator.In
+                    ? "(" + stored + " = ANY(" + arrayParameter + "))"
+                    : "(NOT (" + stored + " = ANY(" + arrayParameter + ")))";
+            }
+
+            string parameter = BindScalarParameter(comparison.Values[0], command, state);
+            string sqlOperator = comparison.Operator switch
+            {
+                MetadataFilterOperator.Equal => "=",
+                MetadataFilterOperator.NotEqual => "<>",
+                MetadataFilterOperator.GreaterThan => ">",
+                MetadataFilterOperator.GreaterThanOrEqual => ">=",
+                MetadataFilterOperator.LessThan => "<",
+                _ => "<="
+            };
+
+            return "(" + stored + " " + sqlOperator + " " + parameter + ")";
+        }
+
+        private static string BindScalarParameter(MetadataFilterValue value, NpgsqlCommand command, TranslatedFilter state)
+        {
+            string name = "mfx" + state.ParameterIndex.ToString(CultureInfo.InvariantCulture);
+            state.ParameterIndex++;
+            command.Parameters.AddWithValue(name, BoxFilterValue(value));
+            return "@" + name;
+        }
+
+        private static string BindArrayParameter(
+            IReadOnlyList<MetadataFilterValue> values, MetadataFilterValueKind kind, NpgsqlCommand command, TranslatedFilter state)
+        {
+            string name = "mfx" + state.ParameterIndex.ToString(CultureInfo.InvariantCulture);
+            state.ParameterIndex++;
+
+            object array;
+            switch (kind)
+            {
+                case MetadataFilterValueKind.Number:
+                    var numbers = new double[values.Count];
+                    for (int i = 0; i < values.Count; i++) { numbers[i] = values[i].NumberValue; }
+                    array = numbers;
+                    break;
+                case MetadataFilterValueKind.Date:
+                    var dates = new DateTime[values.Count];
+                    for (int i = 0; i < values.Count; i++) { dates[i] = values[i].DateValue.UtcDateTime; }
+                    array = dates;
+                    break;
+                case MetadataFilterValueKind.Boolean:
+                    var booleans = new bool[values.Count];
+                    for (int i = 0; i < values.Count; i++) { booleans[i] = values[i].BooleanValue; }
+                    array = booleans;
+                    break;
+                default:
+                    var strings = new string[values.Count];
+                    for (int i = 0; i < values.Count; i++) { strings[i] = values[i].StringValue; }
+                    array = strings;
+                    break;
+            }
+
+            command.Parameters.AddWithValue(name, array);
+            return "@" + name;
+        }
+
+        private static object BoxFilterValue(MetadataFilterValue value)
+        {
+            switch (value.Kind)
+            {
+                case MetadataFilterValueKind.Number:
+                    return value.NumberValue;
+                case MetadataFilterValueKind.Boolean:
+                    return value.BooleanValue;
+                case MetadataFilterValueKind.Date:
+                    // Npgsql maps a UTC DateTime to timestamptz without kind ambiguity.
+                    return value.DateValue.UtcDateTime;
+                default:
+                    return value.StringValue;
+            }
+        }
+
+        /// <summary>
+        /// Builds the schema-qualified, safely-quoted reference to a typed-cast helper function.
+        /// </summary>
+        private string TypedCastFunctionReference(string functionName)
+        {
+            return QuoteIdentifier(_schema) + "." + QuoteIdentifier(functionName);
+        }
+
+        /// <summary>
+        /// Creates the exception-safe cast helper functions used by typed filter comparisons, once per
+        /// store instance. <c>lmkit_try_numeric</c> and <c>lmkit_try_timestamptz</c> return NULL for a
+        /// value that does not parse, so malformed metadata never fails a filtered query; the timestamp
+        /// helper pins the timezone to UTC so values without an explicit offset are read as UTC,
+        /// matching the in-memory evaluation.
+        /// </summary>
+        private async Task EnsureTypedCastHelpersAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
+        {
+            if (_typedCastHelpersEnsured)
+            {
+                return;
+            }
+
+            await _typedCastHelpersGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (_typedCastHelpersEnsured)
+                {
+                    return;
+                }
+
+                string sql =
+                    $"CREATE SCHEMA IF NOT EXISTS {QuoteIdentifier(_schema)}; " +
+                    $"CREATE OR REPLACE FUNCTION {TypedCastFunctionReference("lmkit_try_numeric")}(p_value text) " +
+                    "RETURNS numeric LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$ " +
+                    "BEGIN RETURN btrim(p_value)::numeric; EXCEPTION WHEN OTHERS THEN RETURN NULL; END $$; " +
+                    $"CREATE OR REPLACE FUNCTION {TypedCastFunctionReference("lmkit_try_timestamptz")}(p_value text) " +
+                    "RETURNS timestamptz LANGUAGE plpgsql STABLE PARALLEL SAFE SET timezone = 'UTC' AS $$ " +
+                    "BEGIN RETURN btrim(p_value)::timestamptz; EXCEPTION WHEN OTHERS THEN RETURN NULL; END $$";
+
+                using var command = new NpgsqlCommand(sql, connection);
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                _typedCastHelpersEnsured = true;
+            }
+            finally
+            {
+                _typedCastHelpersGate.Release();
+            }
         }
 
         /// <summary>
