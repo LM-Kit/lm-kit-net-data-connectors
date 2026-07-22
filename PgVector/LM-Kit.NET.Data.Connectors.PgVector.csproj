@@ -4,7 +4,7 @@
 		<LangVersion>latest</LangVersion>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
-		<Version>2026.6.1</Version>
+		<Version>2026.7.1</Version>
 		<RootNamespace>LMKit.Data.Connectors.PgVector</RootNamespace>
 		<GenerateDocumentationFile>True</GenerateDocumentationFile>
 		<Configurations>Debug;Release</Configurations>
@@ -19,10 +19,12 @@
 
 	<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
 		<TreatWarningsAsErrors>True</TreatWarningsAsErrors>
+		<!-- Audit findings in LM-Kit.NET's transitive dependencies cannot be fixed from this project; keep them visible as warnings. -->
+		<WarningsNotAsErrors>$(WarningsNotAsErrors);NU1903</WarningsNotAsErrors>
 	</PropertyGroup>
 
 	<ItemGroup>
-		<PackageReference Include="LM-Kit.NET" Version="2026.5.6" />
+		<PackageReference Include="LM-Kit.NET" Version="2026.7.4" />
 		<PackageReference Include="Npgsql" Version="10.0.3" />
 	</ItemGroup>
 
