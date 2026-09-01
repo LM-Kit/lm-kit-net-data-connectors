@@ -24,7 +24,7 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<PackageReference Include="LM-Kit.NET" Version="2026.7.4" />
+		<PackageReference Include="LM-Kit.NET" Version="2026.8.6" />
 		<PackageReference Include="Qdrant.Client" Version="1.18.1" />
 	</ItemGroup>
 

@@ -24,7 +24,7 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<PackageReference Include="LM-Kit.NET" Version="2026.7.4" />
+		<PackageReference Include="LM-Kit.NET" Version="2026.8.6" />
 		<PackageReference Include="Npgsql" Version="10.0.3" />
 	</ItemGroup>
 
